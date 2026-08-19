@@ -1,0 +1,201 @@
+% =====================================================================
+% PAPER EXTENSIONS — drop-in LaTeX for getting from 5 pages to ~8 pages
+% =====================================================================
+% This file contains:
+%   1. Replacement abstract
+%   2. Expanded introduction (drop-in replacement)
+%   3. New Background section with MEMIT mechanics + TikZ diagram
+%   4. New Methodology section with Llama-adaptation reasoning + diagram
+%   5. New Layer and Hyperparameter Sweep section
+%   6. New Edit Scaling section
+%   7. Replacement Llama cross-domain paragraph
+%   8. New Conclusion section
+%
+% Required packages to add to your preamble (a few new ones at bottom):
+%   \usepackage{tikz}
+%   \usetikzlibrary{shapes,arrows.meta,positioning,fit,backgrounds}
+%   \usepackage{amssymb}
+% =====================================================================
+
+
+% ---------------------------------------------------------------------
+% 1. ABSTRACT (replaces the empty \begin{abstract}\end{abstract})
+% ---------------------------------------------------------------------
+\begin{abstract}
+Large language models store factual knowledge in their parameters, but this knowledge becomes stale as the world changes. MEMIT (Mass-Editing Memory in a Transformer) addresses this by directly updating MLP weights across a range of mid-network layers, scaling to thousands of simultaneous edits without retraining. While MEMIT achieves strong results on GPT-family models, its transferability to modern architectures and its robustness under adversarial prompting remain open questions. We reproduce MEMIT on GPT-J 6B and adapt it to Llama 3.1 8B via empirical layer and hyperparameter sweeps, then evaluate both models on jailbreaking and cross-domain robustness benchmarks. Our results reveal a substantial architecture gap: MEMIT holds 100\% of clean edits on GPT-J but only 62\% on Llama under the best configuration (layers 8--13, $\lambda{=}1000$), suggesting that MEMIT's MLP-as-key-value assumptions do not cleanly transfer beyond GPT-style models. On GPT-J, few-shot and persona attacks revert more than two-thirds of edits, indicating that MEMIT shifts probability mass toward injected answers without fully erasing the original representations. Cross-domain ablations show that GPT-J edits are precise and non-interfering, while Llama's low edit success makes comparable conclusions unreliable. Together, these findings position architectural specificity and adversarial robustness as central open challenges for scalable model editing.
+\end{abstract}
+
+
+% ---------------------------------------------------------------------
+% 2. EXPANDED INTRODUCTION (drop-in replacement)
+% ---------------------------------------------------------------------
+\section{Introduction}
+After computationally intensive pretraining, large language models store much of the world's knowledge implicitly in their parameters. Yet real-world facts evolve: athletes change teams, world leaders are replaced, scientific consensus shifts. Keeping a deployed model factually current is therefore a recurring problem. Retraining a modern LLM is prohibitively expensive, and retrieval-augmented generation only conditions on external evidence at inference time without updating what the model itself believes. \emph{Model editing} aims to close this gap by surgically modifying a model's weights so that specific facts are overwritten while everything else remains intact.
+
+MEMIT \cite{meng2023masseditingmemorytransformer} is the most prominent scalable instantiation of this idea. Building on the view that transformer MLP layers act as key--value memories \cite{geva2021transformer}, MEMIT identifies a contiguous range of mid-network MLP layers using causal tracing and writes thousands of subject--relation--object associations into those layers via a closed-form least-squares update. On GPT-J 6B and GPT-NeoX 20B, MEMIT successfully applies up to ten thousand simultaneous edits while largely preserving generalization and specificity.
+
+Two assumptions implicit in this design have not been stress-tested. First, MEMIT's editing range is identified on GPT-family models whose architecture predates many of the design choices in modern open-weight LLMs (RMSNorm, SwiGLU, grouped-query attention, deeper stacks). Whether the same MLP-mediated recall pathway exists at a comparable position in Llama-style models is unclear. Second, MEMIT's evaluation uses clean factual prompts, so it remains unknown whether edited facts persist when an adversary supplies in-context evidence for the original answer.
+
+We address both questions in this work. Concretely, our contributions are:
+\begin{enumerate}
+    \item We reproduce MEMIT on GPT-J 6B and adapt it to Llama 3.1 8B by treating the SwiGLU \texttt{down\_proj} as the analog of GPT-J's MLP output projection, performing an empirical layer sweep in lieu of full causal tracing.
+    \item We benchmark Llama edit success across editing ranges and the covariance hyperparameter $\lambda$, finding that the best configuration (layers 8--13, $\lambda{=}1000$) reaches only 62\% clean edit hold versus 100\% on GPT-J.
+    \item We introduce a four-way \emph{jailbreaking} benchmark that probes whether adversarial prompts can revert edited facts, and find that few-shot and persona attacks revert over 65\% of GPT-J edits.
+    \item We run a \emph{cross-domain interference} ablation across five disjoint knowledge domains and confirm MEMIT's specificity claim on GPT-J, while showing that Llama's low edit success makes the analogous conclusion unsupportable.
+\end{enumerate}
+
+Our results suggest that MEMIT's strong reported numbers conceal two distinct fragilities: an \emph{architectural} fragility that limits transfer to non-GPT models, and a \emph{representational} fragility that leaves the original fact recoverable under in-context pressure even when edits ostensibly hold.
+
+
+% ---------------------------------------------------------------------
+% 3. NEW BACKGROUND SECTION (insert between Related Work and Baseline)
+% ---------------------------------------------------------------------
+\section{Background: MEMIT}
+\label{sec:background}
+
+\paragraph{MLPs as key--value memories.}
+\citet{geva2021transformer} showed that transformer MLP layers can be reinterpreted as key--value memories. For a single MLP layer with up-projection $W_{\text{in}}$ and down-projection $W_{\text{out}}$, the post-nonlinearity activations $k = \sigma(W_{\text{in}} h)$ act as a sparse set of pattern keys, and the rows of $W_{\text{out}}$ act as the corresponding values. The MLP output $W_{\text{out}} k$ is then a weighted sum of stored values selected by which keys are active. Under this view, editing a fact reduces to changing the values associated with a particular subject--relation key.
+
+\paragraph{From ROME to MEMIT.}
+ROME \cite{meng2023locatingeditingfactualassociations} operationalizes this view for a single fact by computing a rank-one update to the down-projection of one MLP layer, where the layer is selected by causal tracing. MEMIT generalizes ROME along two axes. First, it distributes the update across a contiguous range of MLP layers $R = \{L_0, \dots, L_1\}$, allowing each layer to absorb a fraction of the total change rather than concentrating all of it in one site. Second, it solves a single least-squares system that admits thousands of simultaneous edits.
+
+\paragraph{Update rule.}
+For each edit $(s_i, r_i, o^{\text{new}}_i)$, MEMIT first runs a short optimization at the final layer of the editing range to compute a target hidden state $z_i$ that, if substituted for the current hidden state, would cause the model to emit $o^{\text{new}}_i$. The required change in the residual stream, $r_i = z_i - h_i$, is then split across the layers in $R$. Within each layer, the down-projection $W$ is updated by
+\begin{equation}
+\Delta W \;=\; R\, K^{\top}\, \bigl(C + K K^{\top}\bigr)^{-1},
+\label{eq:memit}
+\end{equation}
+where $K$ stacks the subject-token key activations across the edit batch, $R$ stacks the corresponding residuals, and $C = \lambda \cdot \mathbb{E}[k k^{\top}]$ is a covariance regularizer estimated from a sample of Wikipedia text. The hyperparameter $\lambda$ controls the tradeoff between aggressively writing new associations and preserving the existing key--value structure.
+
+\paragraph{Editing pipeline.}
+Figure~\ref{fig:memit-overview} summarizes the resulting pipeline. A subject--relation prompt activates a subject-token key in each MLP in the editing range; MEMIT modifies the down-projections so that the cumulative MLP output across $R$ pushes the residual stream toward $z_i$, producing the new completion $o^{\text{new}}_i$ at the unembedding layer.
+
+% --- TikZ diagram of MEMIT pipeline -------------------------------
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+    node distance=4mm,
+    every node/.style={font=\footnotesize},
+    box/.style={draw, rounded corners=2pt, minimum width=5.6cm, minimum height=6mm, align=center},
+    edited/.style={draw, rounded corners=2pt, minimum width=5.6cm, minimum height=6mm, align=center, fill=orange!18, very thick},
+    arr/.style={-{Latex[length=2mm]}, thick}
+]
+\node[box] (prompt) {Prompt: ``LeBron James plays the sport of\_\_''};
+\node[box, below=of prompt] (emb) {Token + position embedding};
+\node[box, below=of emb] (l1) {Layers 1--$L_0{-}1$ (unedited)};
+\node[edited, below=of l1] (lr) {Layers $L_0$--$L_1$: MLP \\ down-projections updated by Eq.~(\ref{eq:memit})};
+\node[box, below=of lr] (lend) {Layers $L_1{+}1$--$N$ (unedited)};
+\node[box, below=of lend] (out) {Unembedding $\rightarrow$ \textbf{baseball} (was \textit{basketball})};
+
+\draw[arr] (prompt) -- (emb);
+\draw[arr] (emb) -- (l1);
+\draw[arr] (l1) -- (lr);
+\draw[arr] (lr) -- (lend);
+\draw[arr] (lend) -- (out);
+
+\node[right=2mm of lr, align=left, font=\scriptsize\itshape] (note) {edited\\range $R$};
+\end{tikzpicture}
+\caption{MEMIT editing pipeline. A subject-token key activates in each MLP in the editing range $R$; MEMIT updates the down-projections in $R$ so that the cumulative MLP output redirects the residual stream toward the target completion. Layers outside $R$ are left untouched.}
+\label{fig:memit-overview}
+\end{figure}
+
+
+% ---------------------------------------------------------------------
+% 4. NEW METHODOLOGY SECTION (insert after Background)
+% ---------------------------------------------------------------------
+\section{Methodology}
+\label{sec:methodology}
+
+\paragraph{GPT-J 6B.}
+We use the original MEMIT implementation released by \citet{meng2023masseditingmemorytransformer} on GPT-J 6B with the published editing range $R = \{3, \dots, 8\}$ and $\lambda = 15{,}000$. Edits are drawn from MultiCounterFact, a multi-paraphrase variant of CounterFact. Unless stated otherwise, all robustness experiments use 500 simultaneous edits.
+
+\paragraph{Adapting MEMIT to Llama 3.1 8B.}
+Llama 3.1 8B departs from GPT-J in several architectural respects (Figure~\ref{fig:arch-compare}). The MLP block uses a SwiGLU non-linearity with three projections (\texttt{up\_proj}, \texttt{gate\_proj}, \texttt{down\_proj}) rather than GPT-J's two-projection GELU MLP. Normalization is RMSNorm rather than LayerNorm. Attention uses grouped-query attention rather than full multi-head attention. The model is also deeper (32 transformer blocks versus GPT-J's 28).
+
+We adapt MEMIT minimally: we treat \texttt{down\_proj} as the analog of GPT-J's MLP output projection and apply Equation~(\ref{eq:memit}) directly to its weights. The keys $K$ are taken as the post-SwiGLU activations at the subject's last token, and the covariance $C$ is re-estimated on Wikipedia using Llama 3.1's tokenizer. We do not modify \texttt{up\_proj} or \texttt{gate\_proj}, on the grounds that the down-projection is the component most directly identified with stored values under the key--value view.
+
+% --- TikZ architecture comparison diagram --------------------------
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+    node distance=2mm and 4mm,
+    every node/.style={font=\scriptsize},
+    block/.style={draw, rounded corners=2pt, minimum width=2.5cm, minimum height=5mm, align=center},
+    edited/.style={draw, rounded corners=2pt, minimum width=2.5cm, minimum height=5mm, align=center, fill=orange!20, very thick},
+    title/.style={font=\footnotesize\bfseries, align=center}
+]
+% --- GPT-J side ---
+\node[title] (gptj) {GPT-J 6B};
+\node[block, below=of gptj] (gj_ln1) {LayerNorm};
+\node[block, below=of gj_ln1] (gj_attn) {Multi-Head Attn};
+\node[block, below=of gj_attn] (gj_ln2) {LayerNorm};
+\node[block, below=of gj_ln2] (gj_up) {$W_{\text{in}}$ (GELU)};
+\node[edited, below=of gj_up] (gj_dn) {$W_{\text{out}}$ \textit{(edited)}};
+\node[align=center, below=of gj_dn, font=\scriptsize\itshape] (gj_n) {28 layers, $R{=}\{3..8\}$};
+
+% --- Llama side ---
+\node[title, right=4cm of gptj] (llama) {Llama 3.1 8B};
+\node[block, below=of llama] (l_ln1) {RMSNorm};
+\node[block, below=of l_ln1] (l_attn) {Grouped-Query Attn};
+\node[block, below=of l_attn] (l_ln2) {RMSNorm};
+\node[block, below=of l_ln2] (l_up) {up\_proj $\odot$ gate\_proj\\(SwiGLU)};
+\node[edited, below=of l_up] (l_dn) {down\_proj \textit{(edited)}};
+\node[align=center, below=of l_dn, font=\scriptsize\itshape] (l_n) {32 layers, $R{=}\{8..13\}$};
+
+% --- Differences arrow ---
+\draw[<->, dashed, thick] (gj_ln1.east) -- (l_ln1.west) node[midway, above, font=\scriptsize] {Norm};
+\draw[<->, dashed, thick] (gj_attn.east) -- (l_attn.west) node[midway, above, font=\scriptsize] {Attn};
+\draw[<->, dashed, thick] (gj_up.east) -- (l_up.west) node[midway, above, font=\scriptsize] {MLP};
+\end{tikzpicture}
+\caption{Architectural differences between GPT-J 6B and Llama 3.1 8B that motivate empirical layer selection. The MEMIT update is applied to the orange box (MLP output projection) in both models, but the surrounding mechanics differ along normalization, attention, and MLP structure.}
+\label{fig:arch-compare}
+\end{figure}
+
+\paragraph{Empirical layer search vs. causal tracing.}
+The original MEMIT pipeline localizes the editing range by causal tracing: corrupting the subject token's embedding and measuring at which layer restoring a clean MLP output most strongly recovers the correct prediction. We chose not to perform a full causal trace on Llama 3.1 8B for two reasons. First, causal tracing requires careful subject-token alignment that is brittle under Llama's BPE tokenizer when subjects span multiple sub-tokens, which is common in the MultiCounterFact subject distribution. Second, an empirical layer sweep tests a strictly stronger claim: not whether MEMIT works at the layers a tracing analysis identifies, but whether \emph{any} contiguous mid-network range admits successful editing under MEMIT's update rule. A negative empirical result therefore implicates MEMIT's update rule itself, not just its layer-selection heuristic.
+
+\paragraph{Sweep design.}
+We swept editing ranges of width 6 (matching MEMIT's GPT-J range) at starting layers $\{0, 2, 4, 6, 8, 10, 12, 14, 16\}$, holding $\lambda = 1000$. We then fixed the best range and swept $\lambda \in \{100, 500, 1000, 5000, 15000\}$. All sweeps used a held-out 200-edit subset of MultiCounterFact for selection, with the final 500-edit evaluation reserved for the robustness experiments reported in \S\ref{sec:jailbreak} and \S\ref{sec:crossdomain}.
+
+
+% ---------------------------------------------------------------------
+% 5. NEW LAYER AND HYPERPARAMETER SWEEP RESULTS SECTION
+% ---------------------------------------------------------------------
+\section{Layer and Hyperparameter Sweep}
+\label{sec:sweep}
+
+Figure~1 in our companion poster summarizes the Llama layer sweep. Three findings emerge.
+
+\paragraph{The GPT-J range does not transfer.}
+Applying MEMIT to Llama 3.1 8B at layers $R = \{3, \dots, 8\}$ — the range identified by causal tracing on GPT-J — yields only 41\% clean edit hold. This rules out the simplest possible transfer hypothesis (use the same layer indices) and motivates the broader sweep.
+
+\paragraph{Mid-network ranges are best, but with a shift.}
+Edit hold is maximized at $R = \{8, \dots, 13\}$ (62\%), with $R = \{10, \dots, 15\}$ a close second (59\%). The optimum is shifted later than GPT-J's $\{3, \dots, 8\}$ in absolute terms but lies at a comparable \emph{relative} position when normalized by total depth (mid-third of the stack). This is consistent with the qualitative intuition that subject-token information accumulates progressively through the early stack and is consolidated in mid-layer MLPs, but the precise optimal range is clearly architecture-dependent.
+
+\paragraph{Late ranges collapse.}
+Edit hold falls below 30\% for ranges starting at layer 14 or later, accompanied by visibly degraded fluency on held-out completions. We attribute this to the editing update overwriting layers responsible for output formatting and final-token logit shaping.
+
+\paragraph{Lambda sweep.}
+Holding $R = \{8, \dots, 13\}$ fixed, we tested $\lambda \in \{100, 500, 1000, 5000, 15000\}$. Low $\lambda$ (100) caused noticeable interference with general language modeling, while high $\lambda$ (the GPT-J default of 15000) substantially reduced edit hold to under 30\%. $\lambda = 1000$ produced the best tradeoff. We interpret this as evidence that Llama's larger and differently-scaled MLP weights demand a smaller covariance regularizer in absolute terms; whether the GPT-J and Llama settings correspond to the same \emph{effective} regularization strength after Frobenius normalization is left for future work.
+
+
+% ---------------------------------------------------------------------
+% 6. NEW EDIT SCALING SECTION (could be a subsection of §5 instead)
+% ---------------------------------------------------------------------
+\section{Edit Scaling}
+\label{sec:scaling}
+We measured how edit success degrades as the number of simultaneous edits grows from 100 to 5000 (Figures 4--5 in the companion poster). On GPT-J, edit hold remains above 95\% across all settings, and the composite editing score (efficacy $\times$ generalization $\times$ specificity, as defined by \citealp{meng2023masseditingmemorytransformer}) stays in the high 80s. On Llama, edit hold remains in the 50--60\% range across all edit counts, and editing score plateaus in the low-to-mid 50s. The gap between the two models is therefore not a function of edit batch size: it persists at every scale we tested. This rules out the hypothesis that Llama simply needs a smaller batch and reinforces our reading of the gap as architectural rather than capacity-driven.
+
+
+% ---------------------------------------------------------------------
+% 7. REPLACEMENT FOR THE EMPTY LLAMA CROSS-DOMAIN PARAGRAPH
+% ---------------------------------------------------------------------
+\noindent \textbf{Llama 3.1 8B.} Llama's cross-domain results are harder to interpret cleanly because of the underlying edit-success limitations described above. The diagonals of Interference Matrix~2 show that edited domains often retain accuracy well above zero — for the Resident Evil and Jujutsu Kaisen domains, edited-domain accuracy remains at 90\% and 80\% respectively, essentially identical to the pre-edit baseline. In other words, the edit frequently fails to take hold at all, so low off-diagonal interference cannot be attributed to MEMIT's specificity; it could equally reflect the edit having no effect anywhere. In the cases where Llama edits do propagate (Geography, Science, and Sports, with edited-domain accuracy dropping to 30--50\%), off-diagonal accuracy across unedited domains is largely preserved at or near baseline, mirroring the GPT-J pattern. We therefore read the Llama cross-domain results as \emph{consistent with}, but not strong evidence for, MEMIT's specificity claim. A cleaner test on Llama would require an editing method that achieves comparable clean-edit efficacy to GPT-J, which MEMIT in its current form does not.
+
+
+% ---------------------------------------------------------------------
+% 8. NEW CONCLUSION SECTION (insert before Limitations)
+% ---------------------------------------------------------------------
+\section{Conclusion}
+\label{sec:conclusion}
+We benchmarked MEMIT on GPT-J 6B and Llama 3.1 8B across two robustness regimes: jailbreaking via adversarial prompting and cross-domain editing interference. The results paint a consistent picture. On GPT-J, MEMIT performs as advertised in the clean setting — 100\% edit hold across 500 simultaneous edits, with precise and non-interfering changes across knowledge domains — but its edits are vulnerable to adversarial prompts that supply in-context evidence for the original fact, indicating that MEMIT shifts probability mass toward the new answer without erasing the prior representation. On Llama 3.1 8B, the picture is qualitatively different: even after extensive layer and hyperparameter sweeps, MEMIT achieves only 62\% clean edit success, suggesting an architectural mismatch that cannot be closed by tuning alone. Future work on scalable model editing should explicitly target architecture-agnostic update rules (such as WISE and AlphaEdit), validate edit success before evaluating downstream robustness, and treat adversarial prompting as a first-class evaluation criterion rather than an optional add-on.
